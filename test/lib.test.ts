@@ -13,11 +13,13 @@ import {
   extrapolateEnergy,
   fmtCost,
   fmtEnergy,
+  fmtMem,
   integrateSample,
   kwhOf,
   loadConfig,
   localDayKey,
   migrateLegacyLog,
+  parseProcessCsv,
   parseSmiCsv,
   readTodayTotals,
   sessionCost,
@@ -28,8 +30,16 @@ import {
 
 const CFG: Config = { ratePerKwh: 0.282, currency: "€", intervalMs: 5000, idleWatts: 0 };
 
-function sample(t: number, watts: number, util = 50, memMb = 1000): Sample {
-  return { t, watts, util, memMb, gpuCount: 1 };
+function sample(
+  t: number,
+  watts: number,
+  util = 50,
+  memMb = 1000,
+  tempC = 0,
+  memTotalMb = 0,
+  name = "",
+): Sample {
+  return { t, watts, util, memMb, gpuCount: 1, tempC, memTotalMb, name };
 }
 
 // ---------- parseSmiCsv ----------
@@ -40,7 +50,31 @@ test("parseSmiCsv: single GPU", () => {
     util: 97,
     memMb: 12345,
     gpuCount: 1,
+    tempC: 0,
+    memTotalMb: 0,
+    name: "",
   });
+});
+
+test("parseSmiCsv: temperature, memory.total and name (6-column query)", () => {
+  const out = [
+    "269.5, 97, 12345, 24576, 86, NVIDIA GeForce RTX 4090",
+    "120.0, 40, 512, 16384, 61, NVIDIA RTX A6000",
+  ].join("\n");
+  const p = parseSmiCsv(out);
+  assert.ok(p);
+  assert.equal(p.gpuCount, 2);
+  assert.ok(Math.abs(p.watts - 389.5) < 1e-9);
+  assert.equal(p.util, 97);
+  assert.equal(p.memMb, 12857);
+  assert.equal(p.memTotalMb, 40960);
+  assert.equal(p.tempC, 86); // max across GPUs
+  assert.equal(p.name, "NVIDIA GeForce RTX 4090"); // first readable GPU
+});
+
+test("parseSmiCsv: name containing a comma is preserved (last column)", () => {
+  const p = parseSmiCsv("100, 10, 100, 2048, 55, Foo, Bar");
+  assert.equal(p?.name, "Foo, Bar");
 });
 
 test("parseSmiCsv: multi-GPU sums watts/mem, max util", () => {
@@ -203,6 +237,13 @@ test("integrateSample: clock going backwards contributes zero", () => {
   assert.equal(stats.energyJ, 0);
 });
 
+test("integrateSample: peakTempC tracks the max across samples", () => {
+  const stats = createSessionStats("s1", sample(0, 200, 50, 1000, 70));
+  integrateSample(stats, sample(5000, 200, 50, 1000, 85), CFG);
+  integrateSample(stats, sample(10_000, 200, 50, 1000, 60), CFG);
+  assert.equal(stats.peakTempC, 85);
+});
+
 test("extrapolateEnergy: capped at MAX_EXTRAPOLATE_MS", () => {
   // fresh: 200 W × 5 s = 1000 J
   assert.ok(Math.abs(extrapolateEnergy(200, 0, 5000, 0) - 1000) < 1e-9);
@@ -246,12 +287,51 @@ test("fmtEnergy: Wh below 0.1 kWh, kWh above", () => {
   assert.equal(fmtEnergy(0.1425), "0.14 kWh");
 });
 
+test("fmtMem: MB below 1 GB, trimmed GB above", () => {
+  assert.equal(fmtMem(0), "0 MB");
+  assert.equal(fmtMem(512), "512 MB");
+  assert.equal(fmtMem(1023), "1023 MB");
+  assert.equal(fmtMem(1024), "1GB");
+  assert.equal(fmtMem(15360), "15GB");
+  assert.equal(fmtMem(15872), "15.5GB");
+  assert.equal(fmtMem(24576), "24GB");
+});
+
 test("sessionLabel: shape", () => {
   const stats = createSessionStats("s1", sample(0, 269, 97));
   const label = sessionLabel(stats, CFG, sample(0, 269, 97));
-  assert.ok(label.startsWith("⚡ 269W 97% ·"), label);
+  assert.ok(label.startsWith("⚡ 269W 97% · 1000 MB ·"), label);
   assert.ok(label.includes("€"), label);
   assert.equal(sessionLabel(stats, CFG, null).startsWith("⚡ --"), true);
+});
+
+test("sessionLabel: VRAM segment omitted when 0 MB", () => {
+  const stats = createSessionStats("s1", sample(0, 269, 97, 0));
+  const label = sessionLabel(stats, CFG, sample(0, 269, 97, 0));
+  assert.ok(label.startsWith("⚡ 269W 97% · 0.0 Wh"), label);
+});
+
+test("parseProcessCsv: aggregates per name, sorts by VRAM desc, skips garbage", () => {
+  const out = "1234, llama-server, 4096\n1234, llama-server, 1024\n5678, python, 512\n, , \n";
+  assert.deepEqual(parseProcessCsv(out), [
+    { name: "llama-server", memMb: 5120 },
+    { name: "python", memMb: 512 },
+  ]);
+  assert.deepEqual(parseProcessCsv(""), []);
+  assert.deepEqual(parseProcessCsv("\n"), []);
+});
+
+test("parseProcessCsv: Windows full paths shortened, [N/A] rows skipped", () => {
+  const out = [
+    "1252, [Insufficient Permissions], [N/A]",
+    "6924, C:\\Windows\\explorer.exe, [N/A]",
+    "15508, C:\\Program Files\\llama\\llama-server.exe, 4123",
+    "15509, /usr/bin/python3, 512",
+  ].join("\n");
+  assert.deepEqual(parseProcessCsv(out), [
+    { name: "llama-server.exe", memMb: 4123 },
+    { name: "python3", memMb: 512 },
+  ]);
 });
 
 // ---------- log ----------
@@ -276,13 +356,14 @@ function entryLine(overrides: Record<string, unknown>): string {
 }
 
 test("buildLogEntry: fields and rounding", () => {
-  const stats = createSessionStats("sess-1", sample(1_000_000, 200, 50));
-  integrateSample(stats, sample(1_000_000 + 3_600_000, 210, 60), CFG); // 1 h @ ~205 W
+  const stats = createSessionStats("sess-1", sample(1_000_000, 200, 50, 1000, 72));
+  integrateSample(stats, sample(1_000_000 + 3_600_000, 210, 60, 1000, 85), CFG); // 1 h @ ~205 W
   const entry = buildLogEntry(stats, CFG, 1_000_000 + 3_600_000, "quit");
   assert.equal(entry.sessionId, "sess-1");
   assert.equal(entry.durationMin, 60);
   assert.equal(entry.samples, 2);
   assert.equal(entry.peakWatts, 210);
+  assert.equal(entry.peakTempC, 85);
   assert.equal(entry.avgWatts, 205);
   // rectangle rule: second sample's 210 W covers the whole 1 h interval
   assert.ok(Math.abs(entry.energyWh - 210) < 0.001, `wh=${entry.energyWh}`);

@@ -6,7 +6,7 @@ import { GpuSampler } from "../extensions/gpu-cost/sampler.ts";
 const CFG: Config = { ratePerKwh: 0.282, currency: "€", intervalMs: 5000, idleWatts: 0 };
 
 function sample(t: number, watts: number, util = 50): Sample {
-  return { t, watts, util, memMb: 1000, gpuCount: 1 };
+  return { t, watts, util, memMb: 1000, gpuCount: 1, tempC: 0, memTotalMb: 0, name: "" };
 }
 
 /** Scripted query: returns queued results, or `fail` forever when empty. */

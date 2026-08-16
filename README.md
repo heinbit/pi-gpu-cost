@@ -30,9 +30,12 @@ Samples `nvidia-smi` every few seconds while a pi session is running, integrates
 power over time into energy (Wh), and turns that into money using **your**
 electricity rate.
 
-- **Live footer status:** `⚡ 269W 97% · 0.12 kWh · €0.03`
-- **`/gpucost`** — current session (avg/peak watts, utilization, energy, cost) + today's total across closed sessions
+- **Live footer status:** `⚡ 269W 97% · 14.2GB · 0.12 kWh · €0.03`
+- **`/gpucost`** — current session (avg/peak watts, utilization, energy, cost),
+  live GPU status (name, VRAM used/total, temperature), the processes using
+  the GPU, and today's total across closed sessions
 - **On quit:** summary notification + one JSON line per session in `log.jsonl`
+  (avg/peak watts, peak temperature, energy, cost)
 
 No data ever leaves your machine.
 

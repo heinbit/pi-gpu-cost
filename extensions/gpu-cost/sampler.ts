@@ -28,6 +28,8 @@ export class GpuSampler {
   readonly sessionId: string;
   /** null until start() succeeds */
   stats: SessionStats | null = null;
+  /** most recent successful sample (for on-demand lookups like /gpucost) */
+  last: Sample | null = null;
 
   private readonly cfg: Config;
   private readonly query: () => Promise<Sample | null>;
@@ -58,6 +60,7 @@ export class GpuSampler {
     const first = await this.query();
     if (!first) return null;
     this.stats = createSessionStats(this.sessionId, first);
+    this.last = first;
     this.lastWatts = first.watts;
     return first;
   }
@@ -91,6 +94,7 @@ export class GpuSampler {
       if (this.stats) {
         integrateSample(this.stats, sample, this.cfg);
       }
+      this.last = sample;
       this.lastWatts = sample.watts;
       this.extrapolatedMs = 0;
       this.onSample?.(sample);

@@ -3,8 +3,9 @@
  *
  * - Samples `nvidia-smi` every `intervalMs` (default 5 s) while a session is active
  * - Integrates power over time -> energy (Wh); cost = kWh × ratePerKwh
- * - Live footer status:  ⚡ 269W 97% · 0.12 kWh · €0.03
- * - /gpucost — current session + today's closed sessions
+ * - Live footer status:  ⚡ 269W 97% · 14.2GB · 0.12 kWh · €0.03
+ * - /gpucost — current session, live GPU status (name, VRAM, temperature),
+ *   processes using the GPU, + today's closed sessions
  * - On quit: final summary notification + one line appended to log.jsonl
  *
  * Data directory (default ~/.pi/gpu-cost, override GPU_COST_DIR):
@@ -21,10 +22,12 @@ import {
   buildLogEntry,
   fmtCost,
   fmtEnergy,
+  fmtMem,
   kwhOf,
   loadConfig,
   migrateLegacyLog,
   queryGpu,
+  queryGpuProcesses,
   readTodayTotals,
   resolveDataDir,
   sessionCost,
@@ -157,6 +160,20 @@ export default function (pi: ExtensionAPI) {
         );
       } else {
         lines.push("this session: GPU sampling not running");
+      }
+
+      const last = getLive()?.sampler.last ?? null;
+      if (last) {
+        const parts = [last.name || "GPU"];
+        if (last.memTotalMb > 0) parts.push(`${fmtMem(last.memMb)}/${fmtMem(last.memTotalMb)} VRAM`);
+        else if (last.memMb > 0) parts.push(`${fmtMem(last.memMb)} VRAM`);
+        if (last.tempC > 0) parts.push(`${last.tempC.toFixed(0)}°C`);
+        lines.push(`gpu: ${parts.join(" · ")}`);
+      }
+
+      const procs = await queryGpuProcesses();
+      if (procs.length > 0) {
+        lines.push(`processes: ${procs.slice(0, 5).map((p) => `${p.name} ${fmtMem(p.memMb)}`).join(", ")}`);
       }
 
       const totals = readTodayTotals([logPath(), legacyLogPath()]);

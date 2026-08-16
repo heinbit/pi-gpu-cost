@@ -145,6 +145,12 @@ export interface Sample {
   memMb: number;
   /** number of GPUs contributing a readable power value */
   gpuCount: number;
+  /** max temperature across GPUs, °C (0 = unknown) */
+  tempC: number;
+  /** summed total VRAM across GPUs, MB (0 = unknown) */
+  memTotalMb: number;
+  /** name of the first GPU with a readable power ("" = unknown) */
+  name: string;
 }
 
 export interface SessionStats {
@@ -157,6 +163,8 @@ export interface SessionStats {
   sumWatts: number;
   sumUtil: number;
   peakWatts: number;
+  /** highest observed temperature, °C */
+  peakTempC: number;
   /** integrated energy, joules */
   energyJ: number;
   /** number of failed sample ticks */
@@ -165,9 +173,12 @@ export interface SessionStats {
 
 /**
  * Parse output of:
- *   nvidia-smi --query-gpu=power.draw,utilization.gpu,memory.used --format=csv,noheader,nounits
+ *   nvidia-smi --query-gpu=power.draw,utilization.gpu,memory.used,memory.total,temperature.gpu,name
+ *     --format=csv,noheader,nounits
  *
- * Multiple lines (multi-GPU box): watts and memory summed, utilization = max.
+ * Multiple lines (multi-GPU box): watts and memory summed, utilization and
+ * temperature = max, name = first readable GPU. `name` is the LAST column,
+ * joined from the remaining cells, so names containing commas survive.
  * Lines without a finite power value (e.g. "[N/A]") are ignored.
  * Returns null when no line is usable.
  */
@@ -175,19 +186,30 @@ export function parseSmiCsv(stdout: string): Omit<Sample, "t"> | null {
   let watts = 0;
   let util = 0;
   let mem = 0;
+  let memTotal = 0;
+  let temp = 0;
+  let name = "";
   let gpus = 0;
   for (const line of stdout.split("\n")) {
-    const cells = line.split(",").map((s) => s.trim());
+    const raw = line.split(",");
+    const cells = raw.map((s) => s.trim());
     const w = parseFloat(cells[0] ?? "");
-    const u = cells.length > 1 ? parseFloat(cells[1] ?? "") : NaN;
-    const m = cells.length > 2 ? parseFloat(cells[2] ?? "") : NaN;
     if (!Number.isFinite(w)) continue;
     gpus++;
     watts += w;
+    const u = cells.length > 1 ? parseFloat(cells[1] ?? "") : NaN;
+    const m = cells.length > 2 ? parseFloat(cells[2] ?? "") : NaN;
+    const mt = cells.length > 3 ? parseFloat(cells[3] ?? "") : NaN;
+    const tc = cells.length > 4 ? parseFloat(cells[4] ?? "") : NaN;
     if (Number.isFinite(u)) util = Math.max(util, u);
     if (Number.isFinite(m)) mem += m;
+    if (Number.isFinite(mt)) memTotal += mt;
+    if (Number.isFinite(tc)) temp = Math.max(temp, tc);
+    if (!name && raw.length > 5) name = raw.slice(5).join(",").trim();
   }
-  return gpus > 0 ? { watts, util, memMb: mem, gpuCount: gpus } : null;
+  return gpus > 0
+    ? { watts, util, memMb: mem, gpuCount: gpus, tempC: temp, memTotalMb: memTotal, name }
+    : null;
 }
 
 /** Query all GPUs via nvidia-smi. Resolves null on any failure (missing binary, timeout, bad output). */
@@ -196,12 +218,62 @@ export function queryGpu(opts: { timeoutMs?: number } = {}): Promise<Sample | nu
   return new Promise((resolve) => {
     execFile(
       "nvidia-smi",
-      ["--query-gpu=power.draw,utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+      [
+        "--query-gpu=power.draw,utilization.gpu,memory.used,memory.total,temperature.gpu,name",
+        "--format=csv,noheader,nounits",
+      ],
       { timeout: timeoutMs },
       (err, stdout) => {
         if (err) return resolve(null);
         const parsed = parseSmiCsv(stdout);
         resolve(parsed ? { t: Date.now(), ...parsed } : null);
+      },
+    );
+  });
+}
+
+export interface GpuProcess {
+  /** process name, aggregated across GPUs */
+  name: string;
+  /** total VRAM used, MB */
+  memMb: number;
+}
+
+/**
+ * Parse output of:
+ *   nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits
+ *
+ * VRAM is aggregated per process name (one process may appear once per GPU).
+ * On Windows nvidia-smi reports full paths — only the file name is kept.
+ * Rows without a numeric memory value (e.g. "[N/A]") are skipped.
+ * Sorted by VRAM descending. Returns [] for empty or unreadable output.
+ */
+export function parseProcessCsv(stdout: string): GpuProcess[] {
+  const byName = new Map<string, number>();
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    const cells = line.split(",").map((s) => s.trim());
+    const full = cells[1] ?? "";
+    const sep = Math.max(full.lastIndexOf("/"), full.lastIndexOf("\\"));
+    const name = sep >= 0 ? full.slice(sep + 1) : full;
+    const mem = cells.length > 2 ? parseFloat(cells[2] ?? "") : NaN;
+    if (!name || !Number.isFinite(mem)) continue;
+    byName.set(name, (byName.get(name) ?? 0) + mem);
+  }
+  return [...byName.entries()].map(([name, memMb]) => ({ name, memMb })).sort((a, b) => b.memMb - a.memMb);
+}
+
+/** Query the processes using the GPU(s). Resolves [] on any failure. */
+export function queryGpuProcesses(opts: { timeoutMs?: number } = {}): Promise<GpuProcess[]> {
+  const timeoutMs = opts.timeoutMs ?? 5000;
+  return new Promise((resolve) => {
+    execFile(
+      "nvidia-smi",
+      ["--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
+      { timeout: timeoutMs },
+      (err, stdout) => {
+        if (err) return resolve([]);
+        resolve(parseProcessCsv(stdout));
       },
     );
   });
@@ -216,6 +288,7 @@ export function createSessionStats(sessionId: string, first: Sample): SessionSta
     sumWatts: first.watts,
     sumUtil: first.util,
     peakWatts: first.watts,
+    peakTempC: first.tempC,
     energyJ: 0,
     failed: 0,
   };
@@ -230,6 +303,7 @@ export function integrateSample(stats: SessionStats, sample: Sample, cfg: Config
   stats.sumWatts += sample.watts;
   stats.sumUtil += sample.util;
   stats.peakWatts = Math.max(stats.peakWatts, sample.watts);
+  stats.peakTempC = Math.max(stats.peakTempC, sample.tempC);
   return dt;
 }
 
@@ -275,9 +349,17 @@ export function fmtEnergy(kwh: number): string {
   return kwh < 0.1 ? `${(kwh * 1000).toFixed(1)} Wh` : `${kwh.toFixed(2)} kWh`;
 }
 
+/** Human VRAM size: "512 MB" below 1 GB, trimmed GB above ("24GB", "15.5GB"). */
+export function fmtMem(mb: number): string {
+  if (mb <= 0) return "0 MB";
+  if (mb < 1024) return `${Math.round(mb)} MB`;
+  return `${(mb / 1024).toFixed(1).replace(/\.0$/, "")}GB`;
+}
+
 export function sessionLabel(stats: SessionStats, cfg: Config, last: Sample | null): string {
   const live = last ? `${last.watts.toFixed(0)}W ${last.util.toFixed(0)}%` : "--";
-  return `⚡ ${live} · ${fmtEnergy(kwhOf(stats))} · ${fmtCost(sessionCost(stats, cfg), cfg.currency)}`;
+  const vram = last && last.memMb > 0 ? ` · ${fmtMem(last.memMb)}` : "";
+  return `⚡ ${live}${vram} · ${fmtEnergy(kwhOf(stats))} · ${fmtCost(sessionCost(stats, cfg), cfg.currency)}`;
 }
 
 // ---------- log ----------
@@ -291,6 +373,7 @@ export interface LogEntry {
   failedSamples: number;
   avgWatts: number;
   peakWatts: number;
+  peakTempC: number;
   avgUtil: number;
   energyWh: number;
   cost: number;
@@ -312,6 +395,7 @@ export function buildLogEntry(stats: SessionStats, cfg: Config, endedAt: number,
     failedSamples: stats.failed,
     avgWatts: Math.round(avgWatts * 10) / 10,
     peakWatts: Math.round(stats.peakWatts * 10) / 10,
+    peakTempC: Math.round(stats.peakTempC),
     avgUtil: Math.round(avgUtil * 10) / 10,
     energyWh: Math.round(kwh * 1e6) / 1000,
     cost: Math.round(cost * 100000) / 100000,
