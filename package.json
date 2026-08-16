@@ -1,7 +1,7 @@
 {
   "name": "pi-gpu-cost",
   "version": "0.1.0",
-  "description": "Track GPU power draw and estimated electricity cost per pi session (nvidia-smi)",
+  "description": "Track GPU power draw & electricity cost per pi session (NVIDIA GPUs only, via nvidia-smi)",
   "keywords": [
     "pi-package",
     "pi-extension",
