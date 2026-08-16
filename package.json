@@ -12,6 +12,15 @@
     "cost"
   ],
   "license": "MIT",
+  "author": "heinbit <julbdev@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/heinbit/pi-gpu-cost.git"
+  },
+  "homepage": "https://github.com/heinbit/pi-gpu-cost#readme",
+  "bugs": {
+    "url": "https://github.com/heinbit/pi-gpu-cost/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.18"
