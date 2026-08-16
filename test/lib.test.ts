@@ -311,6 +311,12 @@ test("sessionLabel: VRAM segment omitted when 0 MB", () => {
   assert.ok(label.startsWith("⚡ 269W 97% · 0.0 Wh"), label);
 });
 
+test("sessionLabel: temperature segment when known, omitted when 0", () => {
+  const stats = createSessionStats("s1", sample(0, 269, 97, 1000, 61));
+  assert.ok(sessionLabel(stats, CFG, sample(0, 269, 97, 1000, 61)).startsWith("⚡ 269W 97% · 61°C · 1000 MB ·"));
+  assert.ok(sessionLabel(stats, CFG, sample(0, 269, 97, 1000, 0)).startsWith("⚡ 269W 97% · 1000 MB ·"));
+});
+
 test("parseProcessCsv: aggregates per name, sorts by VRAM desc, skips garbage", () => {
   const out = "1234, llama-server, 4096\n1234, llama-server, 1024\n5678, python, 512\n, , \n";
   assert.deepEqual(parseProcessCsv(out), [

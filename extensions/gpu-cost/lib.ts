@@ -358,8 +358,9 @@ export function fmtMem(mb: number): string {
 
 export function sessionLabel(stats: SessionStats, cfg: Config, last: Sample | null): string {
   const live = last ? `${last.watts.toFixed(0)}W ${last.util.toFixed(0)}%` : "--";
+  const temp = last && last.tempC > 0 ? ` · ${last.tempC.toFixed(0)}°C` : "";
   const vram = last && last.memMb > 0 ? ` · ${fmtMem(last.memMb)}` : "";
-  return `⚡ ${live}${vram} · ${fmtEnergy(kwhOf(stats))} · ${fmtCost(sessionCost(stats, cfg), cfg.currency)}`;
+  return `⚡ ${live}${temp}${vram} · ${fmtEnergy(kwhOf(stats))} · ${fmtCost(sessionCost(stats, cfg), cfg.currency)}`;
 }
 
 // ---------- log ----------

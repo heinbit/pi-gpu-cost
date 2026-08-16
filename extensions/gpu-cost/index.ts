@@ -3,7 +3,7 @@
  *
  * - Samples `nvidia-smi` every `intervalMs` (default 5 s) while a session is active
  * - Integrates power over time -> energy (Wh); cost = kWh × ratePerKwh
- * - Live footer status:  ⚡ 269W 97% · 14.2GB · 0.12 kWh · €0.03
+ * - Live footer status:  ⚡ 269W 97% · 61°C · 14.2GB · 0.12 kWh · €0.03
  * - /gpucost — current session, live GPU status (name, VRAM, temperature),
  *   processes using the GPU, + today's closed sessions
  * - On quit: final summary notification + one line appended to log.jsonl
