@@ -1,7 +1,7 @@
 {
   "name": "pi-gpu-cost",
   "version": "0.3.1",
-  "description": "Track GPU power draw & electricity cost per pi session (NVIDIA GPUs only, via nvidia-smi)",
+  "description": "Track GPU power draw & electricity cost per pi session (NVIDIA GPUs only, via nvidia-smi). pi must run on the same machine as the GPU — it samples the local nvidia-smi and has no remote mode.",
   "keywords": [
     "pi-package",
     "pi-extension",

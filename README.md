@@ -2,14 +2,22 @@
 
 Track GPU power draw and estimated electricity cost for each pi session.
 
+**Its purpose is simple: pi runs on the same machine as the GPU.** The
+extension samples the local `nvidia-smi` on the machine where the pi process
+runs and keeps its log there too — there is no remote mode, so a pi running
+somewhere else (e.g. on a laptop pointed at a remote GPU box) cannot see this
+GPU.
+
 > ## ⚠️ Requirements — read this first
 >
-> **NVIDIA GPUs only.** This package samples power with `nvidia-smi`, so it
-> requires **both**:
+> This package samples power with `nvidia-smi`, so it requires **all of**:
 >
-> 1. **An NVIDIA GPU** (AMD, Intel, and Apple Silicon are **not** supported —
+> 1. **pi on the same machine as the GPU.** The extension spawns `nvidia-smi`
+>    locally on the machine where the pi process runs. A pi running elsewhere
+>    will find no GPU and tracking is disabled (with a warning, no crash).
+> 2. **An NVIDIA GPU** (AMD, Intel, and Apple Silicon are **not** supported —
 >    there is no power-draw backend for them).
-> 2. **`nvidia-smi` on your `PATH`.** It ships with the NVIDIA driver — install
+> 3. **`nvidia-smi` on your `PATH`.** It ships with the NVIDIA driver — install
 >    or update your driver if you don't have it.
 >
 > Verify before installing:
