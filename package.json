@@ -1,0 +1,43 @@
+{
+  "name": "pi-gpu-cost",
+  "version": "0.1.0",
+  "description": "Track GPU power draw and estimated electricity cost per pi session (nvidia-smi)",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "gpu",
+    "nvidia",
+    "nvidia-smi",
+    "energy",
+    "cost"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "extensions",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/lib.test.ts test/sampler.test.ts test/smoke.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@types/node": "^22.10.0",
+    "jiti": "^2.7.0",
+    "typescript": "^5.9.0"
+  }
+}

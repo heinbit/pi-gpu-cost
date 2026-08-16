@@ -1,0 +1,335 @@
+import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import {
+  MAX_EXTRAPOLATE_MS,
+  appendLogEntry,
+  asNum,
+  buildLogEntry,
+  createSessionStats,
+  extrapolateEnergy,
+  fmtCost,
+  fmtEnergy,
+  integrateSample,
+  kwhOf,
+  loadConfig,
+  localDayKey,
+  migrateLegacyLog,
+  parseSmiCsv,
+  readTodayTotals,
+  sessionCost,
+  sessionLabel,
+  type Config,
+  type Sample,
+} from "../extensions/gpu-cost/lib.ts";
+
+const CFG: Config = { ratePerKwh: 0.282, currency: "€", intervalMs: 5000, idleWatts: 0 };
+
+function sample(t: number, watts: number, util = 50, memMb = 1000): Sample {
+  return { t, watts, util, memMb, gpuCount: 1 };
+}
+
+// ---------- parseSmiCsv ----------
+
+test("parseSmiCsv: single GPU", () => {
+  assert.deepEqual(parseSmiCsv("242.15, 97, 12345"), {
+    watts: 242.15,
+    util: 97,
+    memMb: 12345,
+    gpuCount: 1,
+  });
+});
+
+test("parseSmiCsv: multi-GPU sums watts/mem, max util", () => {
+  const out = parseSmiCsv("240.0, 90, 8000\n180.5, 40, 6000");
+  assert.ok(out);
+  assert.equal(out.gpuCount, 2);
+  assert.ok(Math.abs(out.watts - 420.5) < 1e-9);
+  assert.equal(out.util, 90);
+  assert.equal(out.memMb, 14000);
+});
+
+test("parseSmiCsv: [N/A] power line is ignored", () => {
+  assert.equal(parseSmiCsv("[N/A], 0, 100"), null);
+  // one bad line among good ones
+  const out = parseSmiCsv("[N/A], 0, 100\n250.0, 80, 2000");
+  assert.ok(out);
+  assert.equal(out.gpuCount, 1);
+  assert.equal(out.watts, 250);
+});
+
+test("parseSmiCsv: garbage / empty", () => {
+  assert.equal(parseSmiCsv(""), null);
+  assert.equal(parseSmiCsv("\n  \n"), null);
+  assert.equal(parseSmiCsv("not, a, gpu"), null);
+  assert.equal(parseSmiCsv("error: NVIDIA-SMI has failed"), null);
+});
+
+test("parseSmiCsv: whitespace tolerant", () => {
+  const out = parseSmiCsv("  120.0 ,  33 , 4096  \n");
+  assert.ok(out);
+  assert.equal(out.watts, 120);
+  assert.equal(out.util, 33);
+});
+
+// ---------- config ----------
+
+test("loadConfig: defaults when nothing set", () => {
+  const cfg = loadConfig({ env: {}, configPaths: [join(tmpdir(), "does-not-exist-gpu-cost.json")] });
+  assert.deepEqual(cfg, { ratePerKwh: 0.3, currency: "$", intervalMs: 5000, idleWatts: 0 });
+});
+
+test("loadConfig: file values", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-cfg-"));
+  try {
+    const p = join(dir, "config.json");
+    writeFileSync(p, JSON.stringify({ ratePerKwh: 0.282, currency: "€", idleWatts: 20 }));
+    const cfg = loadConfig({ env: {}, configPaths: [p] });
+    assert.equal(cfg.ratePerKwh, 0.282);
+    assert.equal(cfg.currency, "€");
+    assert.equal(cfg.idleWatts, 20);
+    assert.equal(cfg.intervalMs, 5000); // default kept
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: env overrides file; string numbers parse", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-cfg-"));
+  try {
+    const p = join(dir, "config.json");
+    writeFileSync(p, JSON.stringify({ ratePerKwh: 0.5, currency: "€" }));
+    const cfg = loadConfig({
+      env: { GPU_COST_RATE: "0.282", GPU_COST_CURRENCY: "kr", GPU_COST_INTERVAL_MS: "1500" },
+      configPaths: [p],
+    });
+    assert.equal(cfg.ratePerKwh, 0.282);
+    assert.equal(cfg.currency, "kr");
+    assert.equal(cfg.intervalMs, 1500);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: malformed file falls through to next candidate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-cfg-"));
+  try {
+    const bad = join(dir, "bad.json");
+    const good = join(dir, "good.json");
+    writeFileSync(bad, "{ not json");
+    writeFileSync(good, JSON.stringify({ ratePerKwh: 0.42 }));
+    assert.equal(loadConfig({ env: {}, configPaths: [bad] }).ratePerKwh, 0.3); // default
+    assert.equal(loadConfig({ env: {}, configPaths: [bad, good] }).ratePerKwh, 0.42);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: negative/invalid values fall back to defaults; interval clamped", () => {
+  const cfg = loadConfig({
+    env: { GPU_COST_RATE: "-5", GPU_COST_INTERVAL_MS: "10" },
+    configPaths: [],
+  });
+  assert.equal(cfg.ratePerKwh, 0.3);
+  assert.equal(cfg.intervalMs, 50);
+});
+
+test("asNum: edge cases", () => {
+  assert.equal(asNum("0.282", 1), 0.282);
+  assert.equal(asNum(5, 1), 5);
+  assert.equal(asNum("abc", 1), 1);
+  assert.equal(asNum(null, 1), 1);
+  assert.equal(asNum(-1, 1), 1);
+});
+
+// ---------- energy math ----------
+
+test("integrateSample: rectangle rule over elapsed time", () => {
+  const stats = createSessionStats("s1", sample(0, 220));
+  assert.equal(stats.count, 1);
+  assert.equal(stats.energyJ, 0);
+
+  integrateSample(stats, sample(10_000, 220), CFG); // 220 W × 10 s = 2200 J
+  assert.equal(stats.count, 2);
+  assert.ok(Math.abs(stats.energyJ - 2200) < 1e-9);
+  assert.equal(stats.lastT, 10_000);
+
+  integrateSample(stats, sample(15_000, 200), CFG); // 200 W × 5 s = 1000 J
+  assert.ok(Math.abs(stats.energyJ - 3200) < 1e-9);
+  assert.equal(stats.peakWatts, 220);
+});
+
+test("integrateSample: idleWatts clamps at zero", () => {
+  const cfg: Config = { ...CFG, idleWatts: 250 };
+  const stats = createSessionStats("s1", sample(0, 200));
+  integrateSample(stats, sample(10_000, 200), cfg); // 200 < 250 -> no energy
+  assert.equal(stats.energyJ, 0);
+});
+
+test("integrateSample: clock going backwards contributes zero", () => {
+  const stats = createSessionStats("s1", sample(10_000, 200));
+  integrateSample(stats, sample(5_000, 200), CFG);
+  assert.equal(stats.energyJ, 0);
+});
+
+test("extrapolateEnergy: capped at MAX_EXTRAPOLATE_MS", () => {
+  // fresh: 200 W × 5 s = 1000 J
+  assert.ok(Math.abs(extrapolateEnergy(200, 0, 5000, 0) - 1000) < 1e-9);
+  // partially exhausted: 25 s already -> only 5 s of the 10 s allowed
+  assert.ok(Math.abs(extrapolateEnergy(200, 0, 10_000, 25_000) - 1000) < 1e-9);
+  // exhausted: zero
+  assert.equal(extrapolateEnergy(200, 0, 10_000, MAX_EXTRAPOLATE_MS), 0);
+  // idle offset clamps
+  assert.equal(extrapolateEnergy(50, 100, 5000, 0), 0);
+});
+
+test("sessionCost: kWh × rate exactly once (regression for the 1000x bug)", () => {
+  // 38.4 min at 221 W ≈ 0.142 kWh. At 0.282 €/kWh that is ≈ €0.04 — NOT €<0.0001.
+  const stats = createSessionStats("s1", sample(0, 221));
+  for (let t = 5_000; t <= 38.4 * 60_000; t += 5_000) {
+    integrateSample(stats, sample(t, 221), CFG);
+  }
+  const kwh = kwhOf(stats);
+  assert.ok(kwh > 0.13 && kwh < 0.15, `kwh=${kwh}`);
+  const cost = sessionCost(stats, CFG);
+  assert.ok(Math.abs(cost - kwh * 0.282) < 1e-12);
+  assert.ok(cost > 0.03 && cost < 0.05, `cost=${cost}`);
+  assert.ok(cost >= 0.0001, "must not render as <0.0001");
+});
+
+// ---------- formatting ----------
+
+test("fmtCost: thresholds and trailing-zero trim", () => {
+  assert.equal(fmtCost(0.00005, "€"), "€<0.0001");
+  assert.equal(fmtCost(0.0399, "€"), "€0.0399"); // < 1 -> 4 decimals
+  assert.equal(fmtCost(0.04, "€"), "€0.04"); // trailing zeros trimmed
+  assert.equal(fmtCost(0.0099, "€"), "€0.0099");
+  assert.equal(fmtCost(0.01229, "€"), "€0.0123"); // 4-decimal rounding
+  assert.equal(fmtCost(1.234, "€"), "€1.23"); // >= 1 -> 2 decimals
+  assert.equal(fmtCost(10, "$"), "$10");
+});
+
+test("fmtEnergy: Wh below 0.1 kWh, kWh above", () => {
+  assert.equal(fmtEnergy(0.0423), "42.3 Wh");
+  assert.equal(fmtEnergy(0.0999), "99.9 Wh");
+  assert.equal(fmtEnergy(0.1425), "0.14 kWh");
+});
+
+test("sessionLabel: shape", () => {
+  const stats = createSessionStats("s1", sample(0, 269, 97));
+  const label = sessionLabel(stats, CFG, sample(0, 269, 97));
+  assert.ok(label.startsWith("⚡ 269W 97% ·"), label);
+  assert.ok(label.includes("€"), label);
+  assert.equal(sessionLabel(stats, CFG, null).startsWith("⚡ --"), true);
+});
+
+// ---------- log ----------
+
+function entryLine(overrides: Record<string, unknown>): string {
+  return JSON.stringify({
+    sessionId: "x",
+    startedAt: "2026-08-16T10:00:00.000Z",
+    endedAt: "2026-08-16T11:00:00.000Z",
+    durationMin: 60,
+    samples: 720,
+    failedSamples: 0,
+    avgWatts: 200,
+    peakWatts: 270,
+    avgUtil: 70,
+    energyWh: 200,
+    cost: 0.0564,
+    ratePerKwh: 0.282,
+    reason: "quit",
+    ...overrides,
+  });
+}
+
+test("buildLogEntry: fields and rounding", () => {
+  const stats = createSessionStats("sess-1", sample(1_000_000, 200, 50));
+  integrateSample(stats, sample(1_000_000 + 3_600_000, 210, 60), CFG); // 1 h @ ~205 W
+  const entry = buildLogEntry(stats, CFG, 1_000_000 + 3_600_000, "quit");
+  assert.equal(entry.sessionId, "sess-1");
+  assert.equal(entry.durationMin, 60);
+  assert.equal(entry.samples, 2);
+  assert.equal(entry.peakWatts, 210);
+  assert.equal(entry.avgWatts, 205);
+  // rectangle rule: second sample's 210 W covers the whole 1 h interval
+  assert.ok(Math.abs(entry.energyWh - 210) < 0.001, `wh=${entry.energyWh}`);
+  assert.ok(Math.abs(entry.cost - entry.energyWh / 1000 * 0.282) < 1e-5);
+  assert.ok(!Number.isNaN(Date.parse(entry.startedAt)));
+});
+
+test("readTodayTotals: filters by local day, skips malformed, dedupes across files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-log-"));
+  try {
+    const now = new Date();
+    const today = localDayKey(now);
+    const todayA = new Date(now.getTime() - 1 * 3600_000).toISOString();
+    const todayB = new Date(now.getTime() - 2 * 3600_000).toISOString();
+    const yesterday = new Date(now.getTime() - 26 * 3600_000).toISOString();
+    const lineA = entryLine({ startedAt: todayA, energyWh: 100 });
+    const lineB = entryLine({ startedAt: todayB, energyWh: 50 });
+
+    const a = join(dir, "a.jsonl");
+    const b = join(dir, "b.jsonl");
+    writeFileSync(a, [lineA, lineB, entryLine({ startedAt: yesterday, energyWh: 999 }), "not json", JSON.stringify({ startedAt: todayA })].join("\n") + "\n");
+    // file b repeats lineA (legacy dup) plus one malformed-fields line
+    writeFileSync(b, [lineA, JSON.stringify({ energyWh: 77 })].join("\n") + "\n");
+
+    const totals = readTodayTotals([a, b], now);
+    assert.equal(totals.sessions, 2);
+    assert.ok(Math.abs(totals.wh - 150) < 1e-9);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTodayTotals: missing files are fine", () => {
+  const t = readTodayTotals([join(tmpdir(), "nope-1.jsonl"), join(tmpdir(), "nope-2.jsonl")]);
+  assert.deepEqual(t, { wh: 0, sessions: 0 });
+});
+
+test("appendLogEntry: creates dir and appends", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-log-"));
+  try {
+    const p = join(dir, "nested", "log.jsonl");
+    const e1 = buildLogEntry(createSessionStats("a", sample(0, 100)), CFG, 60_000, "quit");
+    const e2 = buildLogEntry(createSessionStats("b", sample(0, 100)), CFG, 60_000, "reload");
+    appendLogEntry(p, e1);
+    appendLogEntry(p, e2);
+    const lines = readFileSync(p, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[0]!).sessionId, "a");
+    assert.equal(JSON.parse(lines[1]!).reason, "reload");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("migrateLegacyLog: renames when target absent, no-op otherwise", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-mig-"));
+  try {
+    const legacy = join(dir, "legacy.jsonl");
+    const target = join(dir, "target.jsonl");
+    writeFileSync(legacy, "line1\n");
+
+    migrateLegacyLog(legacy, target);
+    assert.ok(existsSync(target));
+    assert.ok(!existsSync(legacy));
+    assert.equal(readFileSync(target, "utf8"), "line1\n");
+
+    // re-run: no-op (both or neither state unchanged)
+    writeFileSync(legacy, "line1\n");
+    migrateLegacyLog(legacy, target);
+    assert.equal(readFileSync(target, "utf8"), "line1\n"); // untouched
+    assert.ok(existsSync(legacy)); // kept, target wins
+
+    // identical paths: no-op
+    migrateLegacyLog(target, target);
+    assert.equal(readFileSync(target, "utf8"), "line1\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
