@@ -72,11 +72,16 @@ cp config.example.json ~/.pi/gpu-cost/config.json   # from the package folder, o
 `ratePerKwh` is the **price of one kilowatt-hour in your currency** — the same
 number your electricity bill uses. Examples:
 
-| You bill in… | `ratePerKwh` | `currency` |
-|--------------|--------------|------------|
-| €0.282 / kWh (DE) | `0.282`      | `"€"`      |
-| $0.16 / kWh (US)  | `0.16`       | `"$"`      |
-| 28.2 ct / kWh     | `0.0282`     | `"€"`      |
+| You bill in… | `ratePerKwh` | `currency`          |
+|--------------|--------------|---------------------|
+| €0.282 / kWh (DE) | `0.282`      | `"€"` or `"EUR"`    |
+| $0.16 / kWh (US)  | `0.16`       | `"$"` or `"USD"`    |
+| £0.30 / kWh (UK)  | `0.30`       | `"GBP"`             |
+| 28.2 ct / kWh     | `0.0282`     | `"€"`               |
+
+Both work: ISO 4217 codes (`EUR`, `USD`, `GBP`, `JPY`, `PLN`, …) are
+converted to their symbol; any other string (`"€"`, `"kr"`, `"fr"`) is
+shown as-is.
 
 That's it — costs update from the next session on (env overrides apply live).
 
@@ -85,7 +90,7 @@ That's it — costs update from the next session on (env overrides apply live).
 | key          | default | meaning                                              |
 |--------------|---------|------------------------------------------------------|
 | `ratePerKwh` | `0.3`   | **electricity price per kWh** (your main setting)    |
-| `currency`   | `"$"`   | currency symbol shown next to costs                   |
+| `currency`   | `"$"`   | ISO 4217 code (`"EUR"`, `"JPY"`, …) or any symbol (`"€"`, `"kr"`) |
 | `intervalMs` | `5000`  | `nvidia-smi` sampling interval (min 50)               |
 | `idleWatts`  | `0`     | idle baseline subtracted from draw (0 = no offset)    |
 

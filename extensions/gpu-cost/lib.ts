@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 export interface Config {
   /** electricity price per kWh */
   ratePerKwh: number;
-  /** currency symbol */
+  /** currency symbol (normalized from an ISO 4217 code or literal symbol) */
   currency: string;
   /** nvidia-smi sampling interval in ms */
   intervalMs: number;
@@ -41,6 +41,45 @@ export const DEFAULT_CONFIG: Config = {
 export function asNum(v: unknown, fallback: number): number {
   const n = typeof v === "string" ? parseFloat(v) : typeof v === "number" ? v : NaN;
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/**
+ * Common ISO 4217 codes → display symbols. Codes not in the map (and literal
+ * symbols like "€" or "kr") are passed through unchanged.
+ */
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: "$",
+  EUR: "€",
+  GBP: "£",
+  JPY: "¥",
+  CNY: "¥",
+  PLN: "zł",
+  CHF: "fr",
+  SEK: "kr",
+  NOK: "kr",
+  DKK: "kr",
+  CZK: "Kč",
+  HUF: "Ft",
+  RON: "lei",
+  BGN: "lev",
+  AUD: "A$",
+  CAD: "C$",
+  NZD: "NZ$",
+  SGD: "S$",
+  INR: "₹",
+  KRW: "₩",
+  ZAR: "R",
+};
+
+/**
+ * Normalize a user-supplied currency to a display symbol. Accepts ISO 4217
+ * codes (case-insensitive, e.g. "eur") or literal symbols ("€"); unknown
+ * values pass through unchanged. Empty/missing falls back to the default.
+ */
+export function currencySymbol(v: string | undefined): string {
+  const t = (v ?? "").trim();
+  if (!t) return DEFAULT_CONFIG.currency;
+  return CURRENCY_SYMBOLS[t.toUpperCase()] ?? t;
 }
 
 /**
@@ -81,12 +120,13 @@ export function loadConfig(opts: ConfigOptions = {}): Config {
   const f = file ?? {};
   return {
     ratePerKwh: asNum(env.GPU_COST_RATE ?? f.ratePerKwh, DEFAULT_CONFIG.ratePerKwh),
-    currency:
+    currency: currencySymbol(
       typeof env.GPU_COST_CURRENCY === "string" && env.GPU_COST_CURRENCY.trim()
-        ? env.GPU_COST_CURRENCY.trim()
-        : typeof f.currency === "string" && f.currency.trim()
+        ? env.GPU_COST_CURRENCY
+        : typeof f.currency === "string"
           ? f.currency
-          : DEFAULT_CONFIG.currency,
+          : undefined,
+    ),
     intervalMs: Math.max(50, asNum(env.GPU_COST_INTERVAL_MS ?? f.intervalMs, DEFAULT_CONFIG.intervalMs)),
     idleWatts: asNum(env.GPU_COST_IDLE_WATTS ?? f.idleWatts, DEFAULT_CONFIG.idleWatts),
   };

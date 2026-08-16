@@ -9,6 +9,7 @@ import {
   asNum,
   buildLogEntry,
   createSessionStats,
+  currencySymbol,
   extrapolateEnergy,
   fmtCost,
   fmtEnergy,
@@ -113,6 +114,20 @@ test("loadConfig: env overrides file; string numbers parse", () => {
   }
 });
 
+test("loadConfig: currency normalized from ISO code (file + env), literal kept", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-cfg-"));
+  try {
+    const p = join(dir, "config.json");
+    writeFileSync(p, JSON.stringify({ currency: "EUR" }));
+    assert.equal(loadConfig({ env: {}, configPaths: [p] }).currency, "€");
+    assert.equal(loadConfig({ env: { GPU_COST_CURRENCY: "gbp" }, configPaths: [p] }).currency, "£");
+    writeFileSync(p, JSON.stringify({ currency: "zł" }));
+    assert.equal(loadConfig({ env: {}, configPaths: [p] }).currency, "zł");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig: malformed file falls through to next candidate", () => {
   const dir = mkdtempSync(join(tmpdir(), "gpu-cost-cfg-"));
   try {
@@ -142,6 +157,20 @@ test("asNum: edge cases", () => {
   assert.equal(asNum("abc", 1), 1);
   assert.equal(asNum(null, 1), 1);
   assert.equal(asNum(-1, 1), 1);
+});
+
+test("currencySymbol: ISO codes map to symbols, literals pass through", () => {
+  assert.equal(currencySymbol("EUR"), "€");
+  assert.equal(currencySymbol("usd"), "$");
+  assert.equal(currencySymbol("GBP"), "£");
+  assert.equal(currencySymbol("JPY"), "¥");
+  assert.equal(currencySymbol("PLN"), "zł");
+  assert.equal(currencySymbol("  EUR  "), "€"); // whitespace trimmed
+  assert.equal(currencySymbol("€"), "€"); // literal symbol unchanged
+  assert.equal(currencySymbol("kr"), "kr"); // unknown string passes through
+  assert.equal(currencySymbol("XXY"), "XXY");
+  assert.equal(currencySymbol(""), "$"); // empty -> default
+  assert.equal(currencySymbol(undefined), "$"); // missing -> default
 });
 
 // ---------- energy math ----------

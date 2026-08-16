@@ -1,6 +1,6 @@
 {
   "ratePerKwh": 0.3,
-  "currency": "$",
+  "currency": "USD",
   "intervalMs": 5000,
   "idleWatts": 0
 }
