@@ -3,14 +3,16 @@
  *
  * - Samples `nvidia-smi` every `intervalMs` (default 5 s) while a session is active
  * - Integrates power over time -> energy (Wh); cost = kWh × ratePerKwh
- * - Live footer status:  ⚡ 269W 97% · 61°C · 14.2GB · 0.12 kWh · €0.03
+ * - Live footer status:  ⚡ 269W · 97% · 61°C · 14.2GB · 0.12 kWh · €0.03
  * - /gpucost — current session, live GPU status (name, VRAM, temperature),
- *   processes using the GPU, + today's closed sessions
- * - On quit: final summary notification + one line appended to log.jsonl
+ *   processes using the GPU, + today's closed sessions + monthly cost overview
+ * - On quit: final summary notification + one line per closed session in
+ *   log.jsonl and one row in log.csv (semicolon-separated long-term log)
  *
  * Data directory (default ~/.pi/gpu-cost, override GPU_COST_DIR):
  *   config.json — optional user config (see config.example.json)
  *   log.jsonl   — one JSON line per closed session
+ *   log.csv     — one semicolon-separated row per closed session (long-term log)
  * A config.json next to this file is honored as a second config candidate.
  * Env overrides: GPU_COST_RATE, GPU_COST_CURRENCY, GPU_COST_INTERVAL_MS,
  * GPU_COST_IDLE_WATTS, GPU_COST_DIR.
@@ -18,7 +20,9 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  appendCsvRow,
   appendLogEntry,
+  backfillCsvFromJsonl,
   buildLogEntry,
   fmtCost,
   fmtEnergy,
@@ -28,6 +32,7 @@ import {
   migrateLegacyLog,
   queryGpu,
   queryGpuProcesses,
+  readMonthlyTotals,
   readTodayTotals,
   resolveDataDir,
   sessionCost,
@@ -57,6 +62,7 @@ const setLive = (l: Live | null): void => {
 
 const dataDir = () => resolveDataDir();
 const logPath = () => join(dataDir(), "log.jsonl");
+const csvPath = () => join(dataDir(), "log.csv");
 const legacyLogPath = () => join(EXT_DIR, "log.jsonl");
 const configPaths = () => [join(dataDir(), "config.json"), join(EXT_DIR, "config.json")];
 
@@ -77,6 +83,7 @@ function startSampling(ctx: ExtensionContext): void {
 
     const cfg = loadConfig({ configPaths: configPaths() });
     migrateLegacyLog(legacyLogPath(), logPath());
+    backfillCsvFromJsonl(logPath(), csvPath());
 
     const sampler = new GpuSampler(cfg, sessionIdOf(ctx), {
       // keep the query well inside the sampling interval
@@ -121,6 +128,7 @@ function finalizeSession(reason: string, ctx: ExtensionContext | undefined): voi
   try {
     migrateLegacyLog(legacyLogPath(), logPath());
     appendLogEntry(logPath(), entry);
+    appendCsvRow(csvPath(), entry);
   } catch (e) {
     console.error(`gpu-cost: failed to write log: ${e}`);
   }
@@ -145,7 +153,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("gpucost", {
-    description: "GPU energy & cost: current session + today's total",
+    description: "GPU energy & cost: current session, today + monthly totals",
     handler: async (_args, ctx) => {
       const cfg = loadConfig({ configPaths: configPaths() });
       const lines: string[] = [];
@@ -183,6 +191,14 @@ export default function (pi: ExtensionAPI) {
             totals.wh < 100 ? `${totals.wh.toFixed(1)} Wh` : `${(totals.wh / 1000).toFixed(2)} kWh`
           } = ${fmtCost((totals.wh / 1000) * cfg.ratePerKwh, cfg.currency)}`,
         );
+      }
+
+      const months = readMonthlyTotals([logPath(), legacyLogPath()]);
+      if (months.length > 0) {
+        lines.push("monthly (closed sessions, newest first):");
+        for (const m of months) {
+          lines.push(`  ${m.month}: ${fmtEnergy(m.wh / 1000)} = ${fmtCost(m.cost, cfg.currency)} (${m.sessions})`);
+        }
       }
 
       lines.push(`rate: ${cfg.ratePerKwh} ${cfg.currency}/kWh`);

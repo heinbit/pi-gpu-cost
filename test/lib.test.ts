@@ -4,11 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  CSV_COLUMNS,
   MAX_EXTRAPOLATE_MS,
+  appendCsvRow,
   appendLogEntry,
   asNum,
+  backfillCsvFromJsonl,
   buildLogEntry,
   createSessionStats,
+  csvRow,
   currencySymbol,
   extrapolateEnergy,
   fmtCost,
@@ -21,6 +25,7 @@ import {
   migrateLegacyLog,
   parseProcessCsv,
   parseSmiCsv,
+  readMonthlyTotals,
   readTodayTotals,
   sessionCost,
   sessionLabel,
@@ -300,7 +305,7 @@ test("fmtMem: MB below 1 GB, trimmed GB above", () => {
 test("sessionLabel: shape", () => {
   const stats = createSessionStats("s1", sample(0, 269, 97));
   const label = sessionLabel(stats, CFG, sample(0, 269, 97));
-  assert.ok(label.startsWith("⚡ 269W 97% · 1000 MB ·"), label);
+  assert.ok(label.startsWith("⚡ 269W · 97% · 1000 MB ·"), label);
   assert.ok(label.includes("€"), label);
   assert.equal(sessionLabel(stats, CFG, null).startsWith("⚡ --"), true);
 });
@@ -308,13 +313,13 @@ test("sessionLabel: shape", () => {
 test("sessionLabel: VRAM segment omitted when 0 MB", () => {
   const stats = createSessionStats("s1", sample(0, 269, 97, 0));
   const label = sessionLabel(stats, CFG, sample(0, 269, 97, 0));
-  assert.ok(label.startsWith("⚡ 269W 97% · 0.0 Wh"), label);
+  assert.ok(label.startsWith("⚡ 269W · 97% · 0.0 Wh"), label);
 });
 
 test("sessionLabel: temperature segment when known, omitted when 0", () => {
   const stats = createSessionStats("s1", sample(0, 269, 97, 1000, 61));
-  assert.ok(sessionLabel(stats, CFG, sample(0, 269, 97, 1000, 61)).startsWith("⚡ 269W 97% · 61°C · 1000 MB ·"));
-  assert.ok(sessionLabel(stats, CFG, sample(0, 269, 97, 1000, 0)).startsWith("⚡ 269W 97% · 1000 MB ·"));
+  assert.ok(sessionLabel(stats, CFG, sample(0, 269, 97, 1000, 61)).startsWith("⚡ 269W · 97% · 61°C · 1000 MB ·"));
+  assert.ok(sessionLabel(stats, CFG, sample(0, 269, 97, 1000, 0)).startsWith("⚡ 269W · 97% · 1000 MB ·"));
 });
 
 test("parseProcessCsv: aggregates per name, sorts by VRAM desc, skips garbage", () => {
@@ -445,6 +450,136 @@ test("migrateLegacyLog: renames when target absent, no-op otherwise", () => {
     // identical paths: no-op
     migrateLegacyLog(target, target);
     assert.equal(readFileSync(target, "utf8"), "line1\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- csv ----------
+
+test("csvRow: semicolon-separated fields in CSV_COLUMNS order", () => {
+  const e = buildLogEntry(createSessionStats("s1", sample(0, 200)), CFG, 60_000, "quit");
+  const cells = csvRow(e).split(";");
+  assert.equal(cells.length, CSV_COLUMNS.length);
+  assert.equal(cells[0], "s1");
+  assert.equal(cells[1], e.startedAt);
+  assert.equal(cells[11], String(e.cost));
+  assert.equal(cells[13], "quit");
+});
+
+test("csvRow: quotes cells containing separators or quotes", () => {
+  const e = buildLogEntry(createSessionStats("s1", sample(0, 200)), CFG, 60_000, 'quit "a"; reload');
+  assert.ok(csvRow(e).endsWith('"quit ""a""; reload"'));
+});
+
+test("appendCsvRow: header once, CRLF rows, creates dir", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-csv-"));
+  try {
+    const p = join(dir, "nested", "log.csv");
+    appendCsvRow(p, buildLogEntry(createSessionStats("a", sample(0, 100)), CFG, 60_000, "quit"));
+    appendCsvRow(p, buildLogEntry(createSessionStats("b", sample(0, 100)), CFG, 60_000, "reload"));
+    const raw = readFileSync(p, "utf8");
+    const lines = raw.split("\r\n");
+    assert.equal(lines.length, 4); // header + 2 rows + trailing "" after final CRLF
+    assert.equal(lines[0], CSV_COLUMNS.join(";"));
+    assert.ok(lines[1]!.startsWith("a;"), lines[1]);
+    assert.ok(lines[2]!.startsWith("b;"), lines[2]);
+    assert.equal(lines[3], "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("appendCsvRow: does not duplicate an existing header", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-csv-"));
+  try {
+    const p = join(dir, "log.csv");
+    writeFileSync(p, CSV_COLUMNS.join(";") + "\r\nx;1\n");
+    appendCsvRow(p, buildLogEntry(createSessionStats("a", sample(0, 100)), CFG, 60_000, "quit"));
+    const raw = readFileSync(p, "utf8");
+    const headerCount = raw.split(CSV_COLUMNS.join(";")).length - 1;
+    assert.equal(headerCount, 1, raw);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("backfillCsvFromJsonl: converts existing JSONL once, no-op afterwards", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-csv-"));
+  try {
+    const jsonl = join(dir, "log.jsonl");
+    const csv = join(dir, "log.csv");
+    const l1 = entryLine({ sessionId: "a", energyWh: 100 });
+    const l2 = entryLine({ sessionId: "b", energyWh: 200 });
+    writeFileSync(jsonl, [l1, l2, "not json"].join("\n") + "\n");
+
+    backfillCsvFromJsonl(jsonl, csv);
+    const first = readFileSync(csv, "utf8");
+    const lines = first.split("\r\n");
+    assert.equal(lines[0], CSV_COLUMNS.join(";"));
+    assert.ok(lines[1]!.startsWith("a;"), lines[1]);
+    assert.ok(lines[2]!.startsWith("b;"), lines[2]);
+
+    // re-run: no-op (CSV exists)
+    backfillCsvFromJsonl(jsonl, csv);
+    assert.equal(readFileSync(csv, "utf8"), first);
+
+    // missing jsonl: no-op
+    backfillCsvFromJsonl(join(dir, "nope.jsonl"), join(dir, "other.csv"));
+    assert.ok(!existsSync(join(dir, "other.csv")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- monthly ----------
+
+test("readMonthlyTotals: groups by local month, newest first, sums energy and cost", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-mon-"));
+  try {
+    const a = join(dir, "a.jsonl");
+    writeFileSync(
+      a,
+      [
+        entryLine({ startedAt: "2026-08-01T10:00:00.000Z", energyWh: 100, cost: 0.0282 }),
+        entryLine({ startedAt: "2026-08-30T10:00:00.000Z", energyWh: 50, cost: 0.0141 }),
+        entryLine({ startedAt: "2026-07-15T10:00:00.000Z", energyWh: 200, cost: 0.0564 }),
+        entryLine({ startedAt: "2026-06-02T10:00:00.000Z", energyWh: 10, cost: 0.0028 }),
+        "not json",
+        JSON.stringify({ startedAt: "2026-05-01T10:00:00.000Z" }), // no energyWh — skipped
+      ].join("\n") + "\n",
+    );
+    const months = readMonthlyTotals([a]);
+    assert.deepEqual(months.map((m) => m.month), ["2026-08", "2026-07", "2026-06"]);
+    assert.equal(months[0]!.sessions, 2);
+    assert.ok(Math.abs(months[0]!.wh - 150) < 1e-9);
+    assert.ok(Math.abs(months[0]!.cost - 0.0423) < 1e-9);
+    assert.ok(Math.abs(months[2]!.cost - 0.0028) < 1e-9);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readMonthlyTotals: dedupes across files, honors limit, missing files fine", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gpu-cost-mon-"));
+  try {
+    const a = join(dir, "a.jsonl");
+    const b = join(dir, "b.jsonl");
+    writeFileSync(a, entryLine({ startedAt: "2026-08-01T10:00:00.000Z", energyWh: 100, cost: 0.03 }) + "\n");
+    writeFileSync(b, entryLine({ startedAt: "2026-08-01T10:00:00.000Z", energyWh: 100, cost: 0.03 }) + "\n"); // dup
+    const months = readMonthlyTotals([a, b, join(dir, "nope.jsonl")]);
+    assert.equal(months.length, 1);
+    assert.equal(months[0]!.sessions, 1);
+
+    writeFileSync(
+      a,
+      [
+        entryLine({ startedAt: "2026-01-01T10:00:00.000Z", energyWh: 1, cost: 0.001 }),
+        entryLine({ startedAt: "2026-02-01T10:00:00.000Z", energyWh: 1, cost: 0.001 }),
+        entryLine({ startedAt: "2026-03-01T10:00:00.000Z", energyWh: 1, cost: 0.001 }),
+      ].join("\n"),
+    );
+    assert.deepEqual(readMonthlyTotals([a], 2).map((m) => m.month), ["2026-03", "2026-02"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

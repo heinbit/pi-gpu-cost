@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createJiti } from "jiti";
+import { CSV_COLUMNS } from "../extensions/gpu-cost/lib.ts";
 
 function hasNvidiaSmi(): boolean {
   try {
@@ -106,6 +107,13 @@ smoke("extension lifecycle against real nvidia-smi", async () => {
     // cost must be Wh/1000 × rate — the regression the user reported.
     // (No lower bound: an idle 4090 at ~18 W over ~5 s legitimately costs <€0.0001.)
     assert.ok(Math.abs(e.cost - (e.energyWh / 1000) * 0.282) < 1e-5, `cost=${e.cost} wh=${e.energyWh}`);
+
+    // long-term CSV log got the same session row (header + one row)
+    const csvPath = join(dataDir, "log.csv");
+    assert.ok(existsSync(csvPath), "expected log.csv");
+    const csvLines = readFileSync(csvPath, "utf8").split("\r\n");
+    assert.equal(csvLines[0], CSV_COLUMNS.join(";"));
+    assert.ok(csvLines[1]?.startsWith("smoke-session-123;"), csvLines[1]);
 
     // quit notification fired
     const quitNote = notifications.find((n) => n.startsWith("gpu-cost: "));

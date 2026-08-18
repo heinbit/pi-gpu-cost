@@ -12,6 +12,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -357,7 +358,7 @@ export function fmtMem(mb: number): string {
 }
 
 export function sessionLabel(stats: SessionStats, cfg: Config, last: Sample | null): string {
-  const live = last ? `${last.watts.toFixed(0)}W ${last.util.toFixed(0)}%` : "--";
+  const live = last ? `${last.watts.toFixed(0)}W · ${last.util.toFixed(0)}%` : "--";
   const temp = last && last.tempC > 0 ? ` · ${last.tempC.toFixed(0)}°C` : "";
   const vram = last && last.memMb > 0 ? ` · ${fmtMem(last.memMb)}` : "";
   return `⚡ ${live}${temp}${vram} · ${fmtEnergy(kwhOf(stats))} · ${fmtCost(sessionCost(stats, cfg), cfg.currency)}`;
@@ -410,21 +411,30 @@ export function localDayKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+/** Local-calendar month key (YYYY-MM) — "this month" is a local concept. */
+export function localMonthKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
 export interface TodayTotals {
   wh: number;
   sessions: number;
 }
 
+interface ParsedEntry {
+  startedAt: string;
+  energyWh: number;
+  /** cost in the session's own currency at its own rate (0 when missing) */
+  cost: number;
+}
+
 /**
- * Sum energy of closed sessions started on the local "today" across one or
- * more log files (e.g. new data dir + legacy extension dir). Malformed lines
- * are skipped; identical lines across files are counted once.
+ * Call cb once per unique, parseable log entry across one or more log files
+ * (e.g. new data dir + legacy extension dir). Malformed lines are skipped;
+ * identical lines across files are counted once.
  */
-export function readTodayTotals(logPaths: string[], now: Date = new Date()): TodayTotals {
-  const day = localDayKey(now);
+function forEachLogEntry(logPaths: string[], cb: (e: ParsedEntry, d: Date) => void): void {
   const seen = new Set<string>();
-  let wh = 0;
-  let sessions = 0;
   for (const p of logPaths) {
     if (!existsSync(p)) continue;
     let raw: string;
@@ -444,23 +454,151 @@ export function readTodayTotals(logPaths: string[], now: Date = new Date()): Tod
         continue; // malformed line — skip
       }
       if (typeof entry !== "object" || entry === null) continue;
-      const e = entry as { startedAt?: unknown; energyWh?: unknown };
+      const e = entry as { startedAt?: unknown; energyWh?: unknown; cost?: unknown };
       if (typeof e.energyWh !== "number" || typeof e.startedAt !== "string") continue;
       const d = new Date(e.startedAt);
       if (Number.isNaN(d.getTime())) continue;
-      if (localDayKey(d) === day) {
-        wh += e.energyWh;
-        sessions++;
-      }
+      cb(
+        {
+          startedAt: e.startedAt,
+          energyWh: e.energyWh,
+          cost: typeof e.cost === "number" ? e.cost : 0,
+        },
+        d,
+      );
     }
   }
+}
+
+/**
+ * Sum energy of closed sessions started on the local "today" across one or
+ * more log files. Malformed lines are skipped; identical lines across files
+ * are counted once.
+ */
+export function readTodayTotals(logPaths: string[], now: Date = new Date()): TodayTotals {
+  const day = localDayKey(now);
+  let wh = 0;
+  let sessions = 0;
+  forEachLogEntry(logPaths, (e, d) => {
+    if (localDayKey(d) === day) {
+      wh += e.energyWh;
+      sessions++;
+    }
+  });
   return { wh, sessions };
+}
+
+export interface MonthTotals {
+  /** local calendar month (YYYY-MM) the sessions started in */
+  month: string;
+  /** total energy, Wh */
+  wh: number;
+  /** total cost (each session at its own rate) */
+  cost: number;
+  sessions: number;
+}
+
+/**
+ * Group closed sessions by local calendar month across one or more log
+ * files, newest month first. Each session's cost is summed as stored
+ * (computed at that session's own rate), so later rate changes do not
+ * rewrite history. Months without sessions are omitted; `limit` caps the
+ * number of returned months.
+ */
+export function readMonthlyTotals(logPaths: string[], limit = 6): MonthTotals[] {
+  const byMonth = new Map<string, MonthTotals>();
+  forEachLogEntry(logPaths, (e, d) => {
+    const key = localMonthKey(d);
+    let m = byMonth.get(key);
+    if (!m) {
+      m = { month: key, wh: 0, cost: 0, sessions: 0 };
+      byMonth.set(key, m);
+    }
+    m.wh += e.energyWh;
+    m.cost += e.cost;
+    m.sessions++;
+  });
+  return [...byMonth.values()].sort((a, b) => (a.month < b.month ? 1 : -1)).slice(0, Math.max(0, limit));
 }
 
 /** Append one log entry, creating the data directory if needed. */
 export function appendLogEntry(logPath: string, entry: LogEntry): void {
   mkdirSync(dirname(logPath), { recursive: true });
   appendFileSync(logPath, JSON.stringify(entry) + "\n");
+}
+
+// ---------- long-term CSV log ----------
+
+/** Column order of the long-term CSV log (semicolon-separated). */
+export const CSV_COLUMNS: readonly (keyof LogEntry)[] = [
+  "sessionId",
+  "startedAt",
+  "endedAt",
+  "durationMin",
+  "samples",
+  "failedSamples",
+  "avgWatts",
+  "peakWatts",
+  "peakTempC",
+  "avgUtil",
+  "energyWh",
+  "cost",
+  "ratePerKwh",
+  "reason",
+];
+
+/** Quote a CSV cell only when it contains a separator, quote, or line break. */
+function csvCell(v: string): string {
+  return /[";\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+/** One CSV row for a log entry: fields joined with `;` (Excel-friendly). */
+export function csvRow(entry: LogEntry): string {
+  return CSV_COLUMNS.map((c) => csvCell(String(entry[c] ?? ""))).join(";");
+}
+
+/**
+ * Append one row to the long-term CSV log, writing the header first when the
+ * file is new or empty. Lines end with CRLF (CSV/Excel convention); numbers
+ * keep `.` as decimal separator. Creates the directory if needed.
+ */
+export function appendCsvRow(csvPath: string, entry: LogEntry): void {
+  mkdirSync(dirname(csvPath), { recursive: true });
+  const header = CSV_COLUMNS.join(";");
+  const prefix = !existsSync(csvPath) || statSync(csvPath).size === 0 ? header + "\r\n" : "";
+  appendFileSync(csvPath, prefix + csvRow(entry) + "\r\n");
+}
+
+/**
+ * One-time backfill: when the CSV log does not exist yet but a JSONL log
+ * does, convert all existing JSONL entries into CSV rows so the CSV covers
+ * the full history. No-op when the CSV exists, the JSONL is missing, or it
+ * holds no parseable entries.
+ */
+export function backfillCsvFromJsonl(jsonlPath: string, csvPath: string): void {
+  if (existsSync(csvPath) || !existsSync(jsonlPath)) return;
+  let raw: string;
+  try {
+    raw = readFileSync(jsonlPath, "utf8");
+  } catch {
+    return;
+  }
+  const rows: string[] = [];
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let e: unknown;
+    try {
+      e = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (typeof e !== "object" || e === null) continue;
+    rows.push(csvRow(e as LogEntry));
+  }
+  if (rows.length === 0) return;
+  mkdirSync(dirname(csvPath), { recursive: true });
+  appendFileSync(csvPath, CSV_COLUMNS.join(";") + "\r\n" + rows.join("\r\n") + "\r\n");
 }
 
 /**

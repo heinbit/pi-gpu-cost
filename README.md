@@ -38,11 +38,13 @@ Samples `nvidia-smi` every few seconds while a pi session is running, integrates
 power over time into energy (Wh), and turns that into money using **your**
 electricity rate.
 
-- **Live footer status:** `⚡ 269W 97% · 61°C · 14.2GB · 0.12 kWh · €0.03`
+- **Live footer status:** `⚡ 269W · 97% · 61°C · 14.2GB · 0.12 kWh · €0.03`
 - **`/gpucost`** — current session (avg/peak watts, utilization, energy, cost),
   live GPU status (name, VRAM used/total, temperature), the processes using
-  the GPU, and today's total across closed sessions
+  the GPU, today's total across closed sessions, and a monthly cost overview
+  (newest months first)
 - **On quit:** summary notification + one JSON line per session in `log.jsonl`
+  and one row in the semicolon-separated `log.csv`
   (avg/peak watts, peak temperature, energy, cost)
 
 No data ever leaves your machine.
@@ -136,6 +138,29 @@ Config is resolved in this order (first hit wins):
 
 A legacy `log.jsonl` from older versions (stored next to the extension) is
 migrated automatically on first use.
+
+`log.csv` in the same directory is the long-term log: one semicolon-separated
+row per closed session (same fields as above), CRLF line endings, written on
+every session close — open it directly in Excel or any spreadsheet tool:
+
+```csv
+sessionId;startedAt;endedAt;durationMin;samples;failedSamples;avgWatts;peakWatts;peakTempC;avgUtil;energyWh;cost;ratePerKwh;reason
+abc123;2026-08-16T06:00:00.000Z;2026-08-16T06:39:42.000Z;39.7;476;0;215.1;271.9;85;75;142.5;0.04019;0.282;quit
+```
+
+If `log.csv` does not exist yet, it is backfilled from `log.jsonl` on startup,
+so the CSV covers your full history from day one. (Decimals use `.` as the
+separator; fields containing `;` or quotes are quoted.)
+
+`/gpucost` also prints a **monthly overview** of closed sessions (newest
+months first, up to 6 months; each session is counted at the rate that was
+active when it ran):
+
+```text
+monthly (closed sessions, newest first):
+  2026-08: 1.42 kWh = €0.4004 (12)
+  2026-07: 0.85 kWh = €0.2397 (7)
+```
 
 ## Development
 
